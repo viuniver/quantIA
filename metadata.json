@@ -1,0 +1,5 @@
+{
+  "name": "QuantIA",
+  "description": "AI-powered engineering drawing analysis and quantity take-off tool for construction budgeting. Supports PDF and image analysis with metric system support.",
+  "requestFramePermissions": []
+}
