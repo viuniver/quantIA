@@ -1,13 +1,13 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { 
-  Upload, 
-  FileText, 
-  Ruler, 
-  Layers, 
-  Download, 
-  Plus, 
-  Trash2, 
-  Search, 
+import {
+  Upload,
+  FileText,
+  Ruler,
+  Layers,
+  Download,
+  Plus,
+  Trash2,
+  Search,
   BarChart3,
   Loader2,
   ChevronRight,
@@ -15,13 +15,12 @@ import {
   Settings,
   Info,
   CheckCircle2,
-  AlertCircle,
-  Key
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useDropzone } from 'react-dropzone';
 import * as pdfjs from 'pdfjs-dist';
-import { extractLegend, analyzeTile, QTOItem, LegendItem, identifyDrawingType, chatWithDrawing } from './services/geminiService';
+import type { QTOItem, LegendItem } from './services/geminiService';
+import { trpc } from './lib/trpc';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { MessageSquare, Send } from 'lucide-react';
@@ -31,14 +30,6 @@ import LandingPage from './components/LandingPage';
 const PDFJS_VERSION = '5.4.624';
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 
-declare global {
-  interface Window {
-    aistudio: {
-      hasSelectedApiKey: () => Promise<boolean>;
-      openSelectKey: () => Promise<void>;
-    };
-  }
-}
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -56,7 +47,6 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<{ current: number, total: number } | null>(null);
   const [results, setResults] = useState<QTOItem[]>([]);
-  const [projects, setProjects] = useState<Project[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<number | null>(null);
   const [prompt, setPrompt] = useState('');
   const [scale, setScale] = useState(1);
@@ -70,32 +60,26 @@ export default function App() {
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
-  const [hasApiKey, setHasApiKey] = useState(true);
   const [showLanding, setShowLanding] = useState(true);
   const [mobileActivePanel, setMobileActivePanel] = useState<'viewer' | 'controls' | 'results' | 'chat'>('viewer');
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const checkKey = async () => {
-      if (window.aistudio) {
-        const selected = await window.aistudio.hasSelectedApiKey();
-        setHasApiKey(selected);
-      }
-    };
-    checkKey();
-  }, []);
-
-  const handleOpenKeySelector = async () => {
-    if (window.aistudio) {
-      await window.aistudio.openSelectKey();
-      setHasApiKey(true);
-    }
-  };
+  // tRPC mutations e queries
+  const utils = trpc.useUtils();
+  const { data: projects = [] } = trpc.projects.list.useQuery();
+  const createProject = trpc.projects.create.useMutation({
+    onSuccess: () => utils.projects.list.invalidate(),
+  });
+  const createTakeoff = trpc.takeoffs.create.useMutation();
+  const identifyDrawingTypeMutation = trpc.gemini.identifyDrawingType.useMutation();
+  const extractLegendMutation = trpc.gemini.extractLegend.useMutation();
+  const analyzeTileMutation = trpc.gemini.analyzeTile.useMutation();
+  const chatMutation = trpc.gemini.chat.useMutation();
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
-  
+
   const containerRef = useRef<HTMLDivElement>(null);
 
   const handleWheel = (e: React.WheelEvent) => {
@@ -114,17 +98,13 @@ export default function App() {
   const [isProcessingFile, setIsProcessingFile] = useState(false);
 
   useEffect(() => {
-    fetchProjects();
-  }, []);
-
-  useEffect(() => {
     const identify = async () => {
       if (previewUrl) {
         try {
-          const type = await identifyDrawingType(previewUrl);
+          const type = await identifyDrawingTypeMutation.mutateAsync({ imageBase64: previewUrl });
           setDrawingType(type);
           setChatMessages(prev => [
-            ...prev, 
+            ...prev,
             { role: 'model', text: `Identifiquei que este desenho é uma **${type}**. Podemos começar o levantamento de quantitativos. Você tem alguma área de foco ou item específico que deseja priorizar?` }
           ]);
         } catch (err) {
@@ -137,16 +117,6 @@ export default function App() {
     };
     identify();
   }, [previewUrl]);
-
-  const fetchProjects = async () => {
-    try {
-      const res = await fetch('/api/projects');
-      const data = await res.json();
-      setProjects(data);
-    } catch (err) {
-      console.error('Failed to fetch projects', err);
-    }
-  };
 
   const renderPage = async (pageNumber: number, pdf: pdfjs.PDFDocumentProxy) => {
     setIsProcessingFile(true);
@@ -288,8 +258,8 @@ export default function App() {
     setAnalysisProgress({ current: 0, total: 1 + (TILE_ROWS * TILE_COLS) }); 
     
     try {
-      // 1. Extrair Legenda
-      const legend = await extractLegend(previewUrl);
+      // 1. Extrair Legenda (via tRPC → servidor → Gemini)
+      const legend = await extractLegendMutation.mutateAsync({ imageBase64: previewUrl });
       setAnalysisProgress(p => ({ ...p!, current: 1 }));
 
       // Contexto do chat para a análise
@@ -303,11 +273,15 @@ export default function App() {
       const tiles = await createTiles(previewUrl, TILE_ROWS, TILE_COLS);
       const allResults: QTOItem[] = [];
 
-      // 3. Analisar cada Tile
+      // 3. Analisar cada Tile (via tRPC → servidor → Gemini)
       for (let i = 0; i < tiles.length; i++) {
         const tile = tiles[i];
-        const tileResults = await analyzeTile(tile.data, legend, fullPrompt);
-        
+        const tileResults = await analyzeTileMutation.mutateAsync({
+          tileBase64: tile.data,
+          legend,
+          userPrompt: fullPrompt,
+        });
+
         // Mapear coordenadas de volta para o global (0-1000)
         const mappedResults = tileResults.map(res => ({
           ...res,
@@ -338,41 +312,31 @@ export default function App() {
       }, [] as QTOItem[]);
 
       setResults(groupedResults);
-      
-      // Auto-save to a new project if not already in one
+
+      // Auto-save via tRPC
       let projId = currentProjectId;
       if (!projId) {
-        const res = await fetch('/api/projects', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: file?.name || 'Projeto Sem Nome' })
-        });
-        const newProj = await res.json();
+        const newProj = await createProject.mutateAsync({ name: file?.name || 'Projeto Sem Nome' });
         projId = newProj.id;
         setCurrentProjectId(projId);
-        fetchProjects();
       }
 
-      // Save takeoffs
       if (projId) {
         for (const item of groupedResults) {
-          await fetch(`/api/projects/${projId}/takeoffs`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              item_name: item.itemName,
-              category: item.category,
-              quantity: item.quantity,
-              unit: item.unit,
-              details: { description: item.description, confidence: item.confidence }
-            })
+          await createTakeoff.mutateAsync({
+            projectId: projId,
+            itemName: item.itemName,
+            category: item.category,
+            quantity: item.quantity,
+            unit: item.unit,
+            details: { description: item.description, confidence: item.confidence },
           });
         }
       }
     } catch (err: any) {
       console.error('Analysis failed', err);
       const isQuotaError = err.message?.includes('429') || err.message?.includes('quota') || err.message?.includes('credits');
-      setError(`A análise falhou: ${err.message || 'Erro desconhecido'}. ${isQuotaError ? 'Parece que seus créditos acabaram ou você atingiu o limite. Verifique sua Chave API no ícone de chave no topo.' : 'Tente novamente com um arquivo menor ou mais nítido.'}`);
+      setError(`A análise falhou: ${err.message || 'Erro desconhecido'}. ${isQuotaError ? 'Parece que seus créditos acabaram ou você atingiu o limite.' : 'Tente novamente com um arquivo menor ou mais nítido.'}`);
     } finally {
       setIsAnalyzing(false);
       setAnalysisProgress(null);
@@ -389,16 +353,17 @@ export default function App() {
     setIsChatting(true);
 
     try {
-      const response = await chatWithDrawing(previewUrl, userMsg, chatMessages);
-      setChatMessages(prev => [...prev, { role: 'model', text: response }]);
+      const result = await chatMutation.mutateAsync({
+        imageBase64: previewUrl,
+        message: userMsg,
+        history: chatMessages,
+      });
+      setChatMessages(prev => [...prev, { role: 'model', text: result.text }]);
     } catch (err: any) {
       console.error('Chat failed', err);
-      const isQuotaError = err.message?.includes('429') || err.message?.includes('quota') || err.message?.includes('credits');
-      setChatMessages(prev => [...prev, { 
-        role: 'model', 
-        text: isQuotaError 
-          ? 'Desculpe, parece que seus créditos de IA acabaram ou o limite foi atingido. Por favor, clique no ícone de chave (🔑) no topo para configurar uma chave API com faturamento ativo.' 
-          : 'Desculpe, ocorreu um erro ao processar sua pergunta. Tente novamente em instantes.' 
+      setChatMessages(prev => [...prev, {
+        role: 'model',
+        text: 'Desculpe, ocorreu um erro ao processar sua pergunta. Tente novamente em instantes.'
       }]);
     } finally {
       setIsChatting(false);
@@ -474,24 +439,6 @@ export default function App() {
         </nav>
 
         <div className="flex items-center gap-2 sm:gap-4">
-          {!hasApiKey && (
-            <button 
-              onClick={handleOpenKeySelector}
-              className="flex items-center gap-2 px-2 py-1 bg-amber-50 border border-amber-200 text-amber-700 rounded-lg text-[8px] sm:text-[10px] font-bold uppercase tracking-wider hover:bg-amber-100 transition-all"
-            >
-              <AlertCircle className="w-3 h-3" />
-              <span className="hidden sm:inline">Configurar Chave API</span>
-              <span className="sm:hidden">API</span>
-            </button>
-          )}
-          <button 
-            onClick={handleOpenKeySelector}
-            className="p-1.5 sm:p-2 hover:bg-[#F5F5F0] rounded-full transition-colors relative group"
-            title="Configurar Chave API"
-          >
-            <Key className={cn("w-4 h-4 sm:w-5 sm:h-5", !hasApiKey ? "text-amber-500" : "opacity-60")} />
-            {!hasApiKey && <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-amber-500 rounded-full border-2 border-white" />}
-          </button>
           <button className="p-1.5 sm:p-2 hover:bg-[#F5F5F0] rounded-full transition-colors hidden sm:block">
             <Settings className="w-4 h-4 sm:w-5 sm:h-5 opacity-60" />
           </button>

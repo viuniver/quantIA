@@ -1,81 +1,69 @@
-import express from "express";
-import { createServer as createViteServer } from "vite";
-import path from "path";
-import { fileURLToPath } from "url";
-import Database from "better-sqlite3";
+import 'dotenv/config';
+import express from 'express';
+import cookieParser from 'cookie-parser';
+import { createServer as createViteServer } from 'vite';
+import { createExpressMiddleware } from '@trpc/server/adapters/express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import { appRouter } from './src/server/routers/_app';
+import { authMiddleware, handleOAuthLogin, handleOAuthCallback, handleLogout } from './src/server/auth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const db = new Database("qto.db");
-
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS takeoffs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id INTEGER,
-    item_name TEXT NOT NULL,
-    category TEXT,
-    quantity REAL NOT NULL,
-    unit TEXT NOT NULL,
-    details TEXT,
-    FOREIGN KEY (project_id) REFERENCES projects(id)
-  );
-`);
 
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3000;
 
   app.use(express.json({ limit: '50mb' }));
+  app.use(cookieParser());
+  app.use(authMiddleware);
 
-  // API Routes
-  app.get("/api/projects", (req, res) => {
-    const projects = db.prepare("SELECT * FROM projects ORDER BY created_at DESC").all();
-    res.json(projects);
+  // Auth routes (Manus OAuth)
+  app.get('/auth/login', handleOAuthLogin);
+  app.get('/auth/callback', handleOAuthCallback);
+  app.get('/auth/logout', handleLogout);
+
+  // Endpoint para verificar sessão atual
+  app.get('/auth/me', (req, res) => {
+    const userId = (req as any).userId;
+    if (userId) {
+      res.json({ authenticated: true, userId });
+    } else {
+      res.json({ authenticated: false });
+    }
   });
 
-  app.post("/api/projects", (req, res) => {
-    const { name } = req.body;
-    const result = db.prepare("INSERT INTO projects (name) VALUES (?)").run(name);
-    res.json({ id: result.lastInsertRowid, name });
-  });
+  // tRPC middleware
+  app.use(
+    '/trpc',
+    createExpressMiddleware({
+      router: appRouter,
+      createContext: ({ req, res }) => ({
+        req,
+        res,
+        userId: (req as any).userId,
+      }),
+    })
+  );
 
-  app.get("/api/projects/:id/takeoffs", (req, res) => {
-    const takeoffs = db.prepare("SELECT * FROM takeoffs WHERE project_id = ?").all(req.params.id);
-    res.json(takeoffs);
-  });
-
-  app.post("/api/projects/:id/takeoffs", (req, res) => {
-    const { item_name, category, quantity, unit, details } = req.body;
-    const result = db.prepare(
-      "INSERT INTO takeoffs (project_id, item_name, category, quantity, unit, details) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(req.params.id, item_name, category, quantity, unit, JSON.stringify(details));
-    res.json({ id: result.lastInsertRowid });
-  });
-
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Frontend
+  if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "spa",
+      appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    app.use(express.static(path.join(__dirname, 'dist')));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`QuantIA rodando em http://localhost:${PORT}`);
   });
 }
 
